@@ -22,47 +22,41 @@ use crate::purge::{PurgeHook, PurgeManager};
 use crate::write_barrier::{WriteBarrier, Writer};
 use crate::{Error, GlobalStats, Result};
 
-pub struct Engine<B = DefaultFileBuilder, P = FilePipeLog<B>>
+pub struct Engine<B = DefaultFileBuilder>
 where
     B: FileBuilder,
-    P: PipeLog,
 {
     cfg: Arc<Config>,
     listeners: Vec<Arc<dyn EventListener>>,
 
     stats: Arc<GlobalStats>,
     memtables: MemTableAccessor,
-    pipe_log: Arc<P>,
-    purge_manager: PurgeManager<P>,
+    pipe_log: Arc<FilePipeLog<B>>,
+    purge_manager: PurgeManager<FilePipeLog<B>>,
 
     write_barrier: WriteBarrier<LogBatch, Result<FileBlockHandle>>,
 
     _phantom: PhantomData<B>,
 }
 
-impl Engine<DefaultFileBuilder, FilePipeLog<DefaultFileBuilder>> {
-    pub fn open(
-        cfg: Config,
-    ) -> Result<Engine<DefaultFileBuilder, FilePipeLog<DefaultFileBuilder>>> {
+impl Engine<DefaultFileBuilder> {
+    pub fn open(cfg: Config) -> Result<Engine<DefaultFileBuilder>> {
         Self::open_with_listeners(cfg, vec![])
     }
 
     pub fn open_with_listeners(
         cfg: Config,
         listeners: Vec<Arc<dyn EventListener>>,
-    ) -> Result<Engine<DefaultFileBuilder, FilePipeLog<DefaultFileBuilder>>> {
+    ) -> Result<Engine<DefaultFileBuilder>> {
         Self::open_with(cfg, Arc::new(DefaultFileBuilder), listeners)
     }
 }
 
-impl<B> Engine<B, FilePipeLog<B>>
+impl<B> Engine<B>
 where
     B: FileBuilder,
 {
-    pub fn open_with_file_builder(
-        cfg: Config,
-        file_builder: Arc<B>,
-    ) -> Result<Engine<B, FilePipeLog<B>>> {
+    pub fn open_with_file_builder(cfg: Config, file_builder: Arc<B>) -> Result<Engine<B>> {
         Self::open_with(cfg, file_builder, vec![])
     }
 
@@ -70,7 +64,7 @@ where
         mut cfg: Config,
         file_builder: Arc<B>,
         mut listeners: Vec<Arc<dyn EventListener>>,
-    ) -> Result<Engine<B, FilePipeLog<B>>> {
+    ) -> Result<Engine<B>> {
         cfg.sanitize()?;
         listeners.push(Arc::new(PurgeHook::new()) as Arc<dyn EventListener>);
 
@@ -103,13 +97,7 @@ where
             _phantom: PhantomData,
         })
     }
-}
 
-impl<B, P> Engine<B, P>
-where
-    B: FileBuilder,
-    P: PipeLog,
-{
     /// Writes the content of `log_batch` into the engine and returns written bytes.
     /// If `sync` is true, the write will be followed by a call to `fdatasync` on
     /// the log file.
@@ -283,7 +271,7 @@ where
     }
 }
 
-impl Engine<DefaultFileBuilder, FilePipeLog<DefaultFileBuilder>> {
+impl Engine<DefaultFileBuilder> {
     pub fn consistency_check(path: &Path) -> Result<Vec<(u64, u64)>> {
         Self::consistency_check_with_file_builder(path, Arc::new(DefaultFileBuilder))
     }
@@ -308,7 +296,7 @@ impl Engine<DefaultFileBuilder, FilePipeLog<DefaultFileBuilder>> {
     }
 }
 
-impl<B> Engine<B, FilePipeLog<B>>
+impl<B> Engine<B>
 where
     B: FileBuilder,
 {
