@@ -1,13 +1,17 @@
 // Copyright (c) 2017-present, PingCAP, Inc. Licensed under Apache-2.0.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fs::{self, File};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crossbeam::utils::CachePadded;
 use fail::fail_point;
 use fs2::FileExt;
+use glommio::io::{DmaFile, OpenOptions};
+use libc::*;
 use log::{error, warn};
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -29,7 +33,12 @@ struct FileCollection {
 
 struct ActiveFile<B: FileBuilder> {
     seq: FileSeq,
+    path: PathBuf,
     writer: LogFileWriter<B>,
+}
+
+thread_local! {
+    static DMA_FILE: RefCell<Option<(FileSeq, Rc<DmaFile>)>> = RefCell::new(None);
 }
 
 pub struct SinglePipe<B: FileBuilder> {
@@ -89,6 +98,7 @@ impl<B: FileBuilder> SinglePipe<B> {
         };
         let active_file = ActiveFile {
             seq: active_seq,
+            path: file_id.build_file_path(&cfg.dir),
             writer: build_file_writer(
                 file_builder.as_ref(),
                 &file_id.build_file_path(&cfg.dir),
@@ -145,6 +155,7 @@ impl<B: FileBuilder> SinglePipe<B> {
         self.sync_dir()?;
         let new_file = ActiveFile {
             seq,
+            path: path.clone(),
             writer: build_file_writer(
                 self.file_builder.as_ref(),
                 &path,
@@ -222,6 +233,55 @@ impl<B: FileBuilder> SinglePipe<B> {
         Ok(handle)
     }
 
+    pub async fn append_async(&self, bytes: &[u8]) -> Result<FileBlockHandle> {
+        let mut active_file = self.active_file.lock();
+        let seq = active_file.seq;
+        let file = DMA_FILE.with(|file| file.borrow().clone());
+
+        async fn open_file(seq: u64, path: &Path) -> Result<Rc<DmaFile>> {
+            let file = Rc::new(
+                OpenOptions::new()
+                    .write(true)
+                    .custom_flags(O_DSYNC)
+                    .dma_open(path)
+                    .await?,
+            );
+            DMA_FILE.with(|cell| *cell.borrow_mut() = Some((seq, file.clone())));
+            Ok(file)
+        }
+
+        let file = match file {
+            Some((curr_seq, file)) if seq == curr_seq => file,
+            Some((_, file)) => {
+                DMA_FILE.with(|cell| *cell.borrow_mut() = None);
+                file.close_rc().await?;
+                open_file(seq, &active_file.path).await?
+            }
+            None => open_file(seq, &active_file.path).await?,
+        };
+        let start_offset = active_file.writer.written as u64;
+        let padded_len = (bytes.len() + 4095) / 4096 * 4096;
+        active_file.writer.written += padded_len;
+        drop(active_file);
+
+        let mut buf = file.alloc_dma_buffer(padded_len);
+        buf.as_bytes_mut()[..bytes.len()].copy_from_slice(bytes);
+        file.write_at(buf, start_offset).await?;
+
+        let handle = FileBlockHandle {
+            id: FileId {
+                queue: self.queue,
+                seq,
+            },
+            offset: start_offset,
+            len: padded_len,
+        };
+        for listener in &self.listeners {
+            listener.on_append_log_file(handle);
+        }
+        Ok(handle)
+    }
+
     fn maybe_sync(&self, force: bool) -> Result<()> {
         let mut active_file = self.active_file.lock();
         let seq = active_file.seq;
@@ -233,6 +293,19 @@ impl<B: FileBuilder> SinglePipe<B> {
         } else if writer.since_last_sync() >= self.bytes_per_sync || force {
             if let Err(e) = writer.sync() {
                 panic!("error when sync [{:?}:{}]: {}", self.queue, seq, e,);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn maybe_rotate_async(&self) -> Result<()> {
+        let mut active_file = self.active_file.lock();
+        let seq = active_file.seq;
+        let writer = &mut active_file.writer;
+        if writer.offset() >= self.target_file_size {
+            if let Err(e) = self.rotate_imp(&mut active_file) {
+                panic!("error when rotate [{:?}:{}]: {}", self.queue, seq, e);
             }
         }
 
@@ -290,7 +363,7 @@ impl<B: FileBuilder> SinglePipe<B> {
 }
 
 pub struct DualPipes<B: FileBuilder> {
-    pipes: [SinglePipe<B>; 2],
+    pub pipes: [SinglePipe<B>; 2],
 
     _lock_file: File,
 }

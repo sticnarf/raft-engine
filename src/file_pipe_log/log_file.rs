@@ -238,7 +238,7 @@ pub struct LogFileWriter<B: FileBuilder> {
     fd: Arc<LogFd>,
     writer: B::Writer<LogFile>,
 
-    written: usize,
+    pub written: usize,
     capacity: usize,
     last_sync: usize,
 }

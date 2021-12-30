@@ -157,6 +157,43 @@ where
         Ok(len)
     }
 
+    pub async fn write_async(&self, log_batch: &mut LogBatch) -> Result<usize> {
+        let start = Instant::now();
+        let len = log_batch.finish_populate(self.cfg.batch_compression_threshold.0 as usize)?;
+        let padded_len = (len + 4095) / 4096 * 4096;
+        let block_handle = if !log_batch.is_empty() {
+            let res = self.pipe_log.pipes[LogQueue::Append as usize]
+                .append_async(log_batch.encoded_bytes())
+                .await?;
+            self.pipe_log.pipes[LogQueue::Append as usize]
+                .maybe_rotate_async()
+                .await?;
+            res
+        } else {
+            FileBlockHandle {
+                id: FileId::new(LogQueue::Append, 0),
+                offset: 0,
+                len: 0,
+            }
+        };
+
+        let mut now = Instant::now();
+        if len > 0 {
+            log_batch.finish_write(block_handle);
+            self.memtables.apply(log_batch.drain(), LogQueue::Append);
+            for listener in &self.listeners {
+                listener.post_apply_memtables(block_handle.id);
+            }
+            let end = Instant::now();
+            ENGINE_WRITE_APPLY_DURATION_HISTOGRAM
+                .observe(end.saturating_duration_since(now).as_secs_f64());
+            now = end;
+        }
+        ENGINE_WRITE_DURATION_HISTOGRAM.observe(now.saturating_duration_since(start).as_secs_f64());
+        ENGINE_WRITE_SIZE_HISTOGRAM.observe(padded_len as f64);
+        Ok(padded_len)
+    }
+
     /// Synchronizes the Raft engine.
     pub fn sync(&self) -> Result<()> {
         // TODO(tabokie): use writer.
@@ -248,6 +285,21 @@ where
         let mut log_batch = LogBatch::default();
         log_batch.add_command(region_id, Command::Compact { index });
         if let Err(e) = self.write(&mut log_batch, false) {
+            error!("Failed to write Compact command: {}", e);
+        }
+
+        self.first_index(region_id).unwrap_or(index) - first_index
+    }
+
+    pub async fn compact_to_async(&self, region_id: u64, index: u64) -> u64 {
+        let first_index = match self.first_index(region_id) {
+            Some(index) => index,
+            None => return 0,
+        };
+
+        let mut log_batch = LogBatch::default();
+        log_batch.add_command(region_id, Command::Compact { index });
+        if let Err(e) = self.write_async(&mut log_batch).await {
             error!("Failed to write Compact command: {}", e);
         }
 

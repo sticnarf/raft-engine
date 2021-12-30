@@ -1,5 +1,6 @@
-// Copyright (c) 2017-present, PingCAP, Inc. Licensed under Apache-2.0.
+use std::sync::Arc;
 
+use glommio::LocalExecutorBuilder;
 use kvproto::raft_serverpb::RaftLocalState;
 use raft::eraftpb::Entry;
 use raft_engine::{Config, Engine, LogBatch, MessageExt, ReadableSize};
@@ -17,8 +18,6 @@ impl MessageExt for MessageExtTyped {
     }
 }
 
-// How to run the example:
-// $ RUST_LOG=debug cargo run --release --example append-compact-purge
 fn main() {
     env_logger::init();
 
@@ -28,8 +27,24 @@ fn main() {
         batch_compression_threshold: ReadableSize::kb(0),
         ..Default::default()
     };
-    let engine = Engine::open(config).expect("Open raft engine");
+    let engine = Arc::new(Engine::open(config).expect("Open raft engine"));
 
+    let engine2 = engine.clone();
+    let handle1 = LocalExecutorBuilder::new()
+        .pin_to_cpu(0)
+        .io_memory(256 << 10)
+        .spawn(move || run(engine2))
+        .unwrap();
+    let handle2 = LocalExecutorBuilder::new()
+        .pin_to_cpu(1)
+        .io_memory(256 << 10)
+        .spawn(move || run(engine))
+        .unwrap();
+    handle1.join().unwrap();
+    handle2.join().unwrap();
+}
+
+async fn run(engine: Arc<Engine>) {
     let compact_offset = 32; // In src/purge.rs, it's the limit for rewrite.
 
     let mut rand_regions = Normal::new(128.0, 96.0)
@@ -62,13 +77,14 @@ fn main() {
             batch
                 .put_message(region, b"last_index".to_vec(), &state)
                 .unwrap();
-            engine.write(&mut batch, false).unwrap();
+            engine.write_async(&mut batch).await.unwrap();
+            // engine.write(&mut batch, true).unwrap();
 
             if state.last_index % compact_offset == 0 {
                 let rand_compact_offset = rand_compacts.next().unwrap();
                 if state.last_index > rand_compact_offset {
                     let compact_to = state.last_index - rand_compact_offset;
-                    engine.compact_to(region, compact_to);
+                    engine.compact_to_async(region, compact_to).await;
                     println!("[EXAMPLE] compact {} to {}", region, compact_to);
                 }
             }
@@ -78,7 +94,7 @@ fn main() {
                 .get_message::<RaftLocalState>(region, b"last_index")
                 .unwrap()
                 .unwrap();
-            engine.compact_to(region, state.last_index - 7);
+            engine.compact_to_async(region, state.last_index - 7).await;
             println!(
                 "[EXAMPLE] force compact {} to {}",
                 region,

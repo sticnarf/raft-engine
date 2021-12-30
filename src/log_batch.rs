@@ -1,5 +1,6 @@
 // Copyright (c) 2017-present, PingCAP, Inc. Licensed under Apache-2.0.
 
+use std::backtrace::Backtrace;
 use std::fmt::Debug;
 use std::io::BufRead;
 use std::{mem, u64};
@@ -457,14 +458,11 @@ impl LogItemBatch {
     }
 
     pub fn encode(&self, buf: &mut Vec<u8>) -> Result<()> {
-        let offset = buf.len();
         let count = self.items.len() as u64;
         buf.encode_var_u64(count)?;
         for item in self.items.iter() {
             item.encode(buf)?;
         }
-        let checksum = crc32(&buf[offset..]);
-        buf.encode_u32_le(checksum)?;
         Ok(())
     }
 
@@ -660,12 +658,19 @@ impl LogBatch {
         let footer_roffset = self.buf.len() - header_offset;
 
         // footer
+        let footer_offset = self.buf.len();
         self.item_batch.encode(&mut self.buf)?;
         self.item_batch.finish_populate(compression_type);
 
+        let real_len = self.buf.len() - header_offset + 4;
+        let padded_len = (real_len + 4095) / 4096 * 4096;
+        self.buf.resize(padded_len + header_offset - 4, 0);
+
+        let checksum = crc32(&self.buf[footer_offset..]);
+        self.buf.encode_u32_le(checksum)?;
+
         // header
-        let len =
-            (((self.buf.len() - header_offset) as u64) << 8) | u64::from(compression_type.to_u8());
+        let len = ((padded_len as u64) << 8) | u64::from(compression_type.to_u8());
         (&mut self.buf[header_offset..header_offset + 8]).write_u64::<BigEndian>(len)?;
         (&mut self.buf[header_offset + 8..header_offset + 16])
             .write_u64::<BigEndian>(footer_roffset as u64)?;
@@ -689,7 +694,7 @@ impl LogBatch {
         }
 
         self.buf_state = BufState::Sealed(header_offset, footer_roffset - LOG_BATCH_HEADER_LEN);
-        Ok(self.buf.len() - header_offset)
+        Ok(real_len)
     }
 
     pub(crate) fn encoded_bytes(&self) -> &[u8] {
@@ -817,6 +822,7 @@ fn verify_checksum(buf: &[u8]) -> Result<()> {
     let expected = codec::decode_u32_le(&mut &buf[buf.len() - LOG_BATCH_CHECKSUM_LEN..])?;
     let actual = crc32(&buf[..buf.len() - LOG_BATCH_CHECKSUM_LEN]);
     if actual != expected {
+        error!("{:?}", Backtrace::force_capture());
         return Err(Error::Corruption(format!(
             "Checksum expected {} but got {}",
             expected, actual
