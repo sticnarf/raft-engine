@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use glommio::LocalExecutorBuilder;
+use glommio::{LocalExecutorBuilder, Placement};
 use kvproto::raft_serverpb::RaftLocalState;
 use raft::eraftpb::Entry;
 use raft_engine::{Config, Engine, LogBatch, MessageExt, ReadableSize};
@@ -30,13 +30,11 @@ fn main() {
     let engine = Arc::new(Engine::open(config).expect("Open raft engine"));
 
     let engine2 = engine.clone();
-    let handle1 = LocalExecutorBuilder::new()
-        .pin_to_cpu(0)
+    let handle1 = LocalExecutorBuilder::new(Placement::Fixed(0))
         .io_memory(256 << 10)
         .spawn(move || run(engine2))
         .unwrap();
-    let handle2 = LocalExecutorBuilder::new()
-        .pin_to_cpu(1)
+    let handle2 = LocalExecutorBuilder::new(Placement::Fixed(0))
         .io_memory(256 << 10)
         .spawn(move || run(engine))
         .unwrap();
