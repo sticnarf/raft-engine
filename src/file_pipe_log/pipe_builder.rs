@@ -15,6 +15,7 @@ use crate::log_batch::LogItemBatch;
 use crate::pipe_log::{FileId, FileSeq, LogQueue};
 use crate::Result;
 
+use super::async_pipe::AsyncPipe;
 use super::format::FileNameExt;
 use super::log_file::{build_file_reader, LogFd};
 use super::pipe::{DualPipes, SinglePipe};
@@ -168,7 +169,9 @@ impl<B: FileBuilder> DualPipesBuilder<B> {
     }
 
     pub fn finish(self) -> Result<DualPipes<B>> {
-        let appender = self.build_pipe(LogQueue::Append)?;
+        let first_seq = self.append_files.first().map(|f| f.seq).unwrap_or(0);
+        let files: VecDeque<Arc<LogFd>> = self.append_files.iter().map(|f| f.fd.clone()).collect();
+        let appender = AsyncPipe::open(&self.cfg, first_seq, files)?;
         let rewriter = self.build_pipe(LogQueue::Rewrite)?;
         DualPipes::open(&self.cfg.dir, appender, rewriter)
     }

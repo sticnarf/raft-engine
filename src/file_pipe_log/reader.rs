@@ -40,7 +40,14 @@ impl<B: FileBuilder> LogItemBatchFileReader<B> {
     pub fn open(&mut self, file_id: FileId, reader: LogFileReader<B>) -> Result<()> {
         self.file_id = Some(file_id);
         self.size = reader.file_size()?;
+        if self.size == 0 {
+            let mut buf = Vec::with_capacity(LogFileHeader::len());
+            LogFileHeader::default().encode(&mut buf)?;
+            reader.fd.write(0, &buf)?;
+            self.size = reader.file_size()?;
+        }
         self.reader = Some(reader);
+
         self.buffer.clear();
         self.buffer_offset = 0;
         self.valid_offset = 0;
@@ -61,7 +68,7 @@ impl<B: FileBuilder> LogItemBatchFileReader<B> {
     }
 
     pub fn next(&mut self) -> Result<Option<LogItemBatch>> {
-        if self.valid_offset < self.size {
+        while self.valid_offset < self.size {
             if self.valid_offset < LOG_BATCH_HEADER_LEN {
                 return Err(Error::Corruption(
                     "attempt to read file with broken header".to_owned(),
@@ -72,6 +79,10 @@ impl<B: FileBuilder> LogItemBatchFileReader<B> {
                 LOG_BATCH_HEADER_LEN,
                 0,
             )?)?;
+            if footer_offset == 0 && len == 0 {
+                self.valid_offset += 4096;
+                continue;
+            }
             if self.valid_offset + len > self.size {
                 return Err(Error::Corruption("log batch header broken".to_owned()));
             }

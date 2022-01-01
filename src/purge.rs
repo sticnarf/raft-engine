@@ -80,6 +80,7 @@ where
             if let (Some(rewrite_watermark), Some(compact_watermark)) =
                 self.append_queue_watermarks()
             {
+                info!("start purging {} {}", rewrite_watermark, compact_watermark);
                 should_compact =
                     self.rewrite_or_compact_append_queue(rewrite_watermark, compact_watermark)?;
                 let (first_append, latest_append) = self.pipe_log.file_span(LogQueue::Append);
@@ -169,6 +170,13 @@ where
             // Can't rewrite or force compact the active file.
             return (None, None);
         }
+        let oldest = crate::file_pipe_log::WRITING_SEQS
+            .lock()
+            .iter()
+            .next()
+            .map(|(seq, _)| *seq)
+            .unwrap_or(u64::MAX);
+        let active_file = std::cmp::min(active_file, oldest);
 
         let rewrite_watermark = self.pipe_log.file_at(queue, REWRITE_RATIO);
         let compact_watermark = self.pipe_log.file_at(queue, FORCE_COMPACT_RATIO);
@@ -246,12 +254,12 @@ where
         })?;
         if purged > 0 {
             info!("purged {} expired log files for queue {:?}", purged, queue);
-            for listener in &self.listeners {
-                listener.post_purge(FileId {
-                    queue,
-                    seq: min_seq - 1,
-                });
-            }
+            // for listener in &self.listeners {
+            //     listener.post_purge(FileId {
+            //         queue,
+            //         seq: min_seq - 1,
+            //     });
+            // }
         }
         Ok(())
     }

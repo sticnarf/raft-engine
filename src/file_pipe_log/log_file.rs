@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use fail::fail_point;
-use log::error;
+use log::{debug, error};
 use nix::errno::Errno;
 use nix::fcntl::{self, OFlag};
 use nix::sys::stat::Mode;
@@ -27,6 +27,7 @@ const FILE_ALLOCATE_SIZE: usize = 2 * 1024 * 1024;
 ///
 /// This implementation is a thin wrapper around `RawFd`, and primarily targets
 /// UNIX-based systems.
+#[derive(Hash)]
 pub struct LogFd(RawFd);
 
 fn from_nix_error(e: nix::Error, custom: &'static str) -> std::io::Error {
@@ -334,7 +335,7 @@ pub fn build_file_reader<B: FileBuilder>(
 
 /// Random-access reader for log file.
 pub struct LogFileReader<B: FileBuilder> {
-    fd: Arc<LogFd>,
+    pub fd: Arc<LogFd>,
     reader: B::Reader<LogFile>,
 
     offset: usize,
@@ -353,6 +354,10 @@ impl<B: FileBuilder> LogFileReader<B> {
     pub fn read(&mut self, handle: FileBlockHandle) -> Result<Vec<u8>> {
         let mut buf = vec![0; handle.len];
         let size = self.read_to(handle.offset, &mut buf)?;
+        if size < handle.len {
+            debug!("{:?}", handle);
+            std::process::exit(1);
+        }
         buf.truncate(size);
         Ok(buf)
     }

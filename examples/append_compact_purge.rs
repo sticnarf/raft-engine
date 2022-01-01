@@ -1,7 +1,12 @@
-use std::sync::Arc;
+use std::{
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use glommio::{LocalExecutorBuilder, Placement};
+use glommio::{sync::Semaphore, LocalExecutorBuilder, Placement};
 use kvproto::raft_serverpb::RaftLocalState;
+use log::debug;
 use raft::eraftpb::Entry;
 use raft_engine::{Config, Engine, LogBatch, MessageExt, ReadableSize};
 use rand::thread_rng;
@@ -28,18 +33,37 @@ fn main() {
         ..Default::default()
     };
     let engine = Arc::new(Engine::open(config).expect("Open raft engine"));
-
-    let engine2 = engine.clone();
-    let handle1 = LocalExecutorBuilder::new(Placement::Fixed(0))
-        .io_memory(256 << 10)
-        .spawn(move || run(engine2))
+    let mut handles = Vec::new();
+    for i in 0..2 {
+        let engine = engine.clone();
+        let handle = LocalExecutorBuilder::new(Placement::Unbound)
+            .spawn(move || run(engine))
+            .unwrap();
+        handles.push(handle);
+    }
+    let purge = LocalExecutorBuilder::new(Placement::Fixed(0))
+        .spawn(move || async move {
+            loop {
+                for region in engine.purge_expired_files().unwrap() {
+                    let state = engine
+                        .get_message::<RaftLocalState>(region, b"last_index")
+                        .unwrap()
+                        .unwrap();
+                    engine.compact_to_async(region, state.last_index - 7).await;
+                    println!(
+                        "[EXAMPLE] force compact {} to {}",
+                        region,
+                        state.last_index - 7
+                    );
+                }
+                glommio::timer::sleep(Duration::from_secs(1)).await;
+            }
+        })
         .unwrap();
-    let handle2 = LocalExecutorBuilder::new(Placement::Fixed(0))
-        .io_memory(256 << 10)
-        .spawn(move || run(engine))
-        .unwrap();
-    handle1.join().unwrap();
-    handle2.join().unwrap();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    purge.join().unwrap();
 }
 
 async fn run(engine: Arc<Engine>) {
@@ -54,50 +78,55 @@ async fn run(engine: Arc<Engine>) {
         .sample_iter(thread_rng())
         .map(|x| x as u64);
 
-    let mut batch = LogBatch::with_capacity(256);
     let mut entry = Entry::new();
-    entry.set_data(vec![b'x'; 1024 * 32].into());
+    entry.set_data(vec![b'x'; 17462].into());
     let init_state = RaftLocalState {
         last_index: 0,
         ..Default::default()
     };
+    let sem = Rc::new(Semaphore::new(65536));
     loop {
-        for _ in 0..1024 {
-            let region = rand_regions.next().unwrap();
-            let state = engine
-                .get_message::<RaftLocalState>(region, b"last_index")
-                .unwrap()
-                .unwrap_or_else(|| init_state.clone());
+        let acquire_begin = Instant::now();
+        let permit = Semaphore::acquire_static_permit(&sem, 1).await.unwrap();
+        let acquire_elapsed = acquire_begin.elapsed();
+        if acquire_elapsed > Duration::from_millis(50) {
+            debug!("acquire elapsed {:?}", acquire_elapsed);
+        }
 
-            let mut e = entry.clone();
-            e.index = state.last_index + 1;
-            batch.add_entries::<MessageExtTyped>(region, &[e]).unwrap();
-            batch
-                .put_message(region, b"last_index".to_vec(), &state)
-                .unwrap();
-            engine.write_async(&mut batch).await.unwrap();
-            // engine.write(&mut batch, true).unwrap();
+        let mut batch = LogBatch::with_capacity(256);
+        let region = rand_regions.next().unwrap();
+        let state = engine
+            .get_message::<RaftLocalState>(region, b"last_index")
+            .unwrap()
+            .unwrap_or_else(|| init_state.clone());
 
-            if state.last_index % compact_offset == 0 {
-                let rand_compact_offset = rand_compacts.next().unwrap();
-                if state.last_index > rand_compact_offset {
-                    let compact_to = state.last_index - rand_compact_offset;
-                    engine.compact_to_async(region, compact_to).await;
+        let mut e = entry.clone();
+        e.index = state.last_index + 1;
+        batch.add_entries::<MessageExtTyped>(region, &[e]).unwrap();
+        batch
+            .put_message(region, b"last_index".to_vec(), &state)
+            .unwrap();
+        let engine2 = engine.clone();
+        glommio::spawn_local(async move {
+            engine2.write_async(&mut batch).await.unwrap();
+            drop(permit);
+        })
+        .detach();
+
+        // engine.write(&mut batch, true).unwrap();
+
+        if state.last_index % compact_offset == 0 {
+            let rand_compact_offset = rand_compacts.next().unwrap();
+            if state.last_index > rand_compact_offset {
+                let compact_to = state.last_index - rand_compact_offset;
+                let engine2 = engine.clone();
+                glommio::spawn_local(async move {
+                    engine2.compact_to_async(region, compact_to).await;
                     println!("[EXAMPLE] compact {} to {}", region, compact_to);
-                }
+                })
+                .detach();
             }
         }
-        for region in engine.purge_expired_files().unwrap() {
-            let state = engine
-                .get_message::<RaftLocalState>(region, b"last_index")
-                .unwrap()
-                .unwrap();
-            engine.compact_to_async(region, state.last_index - 7).await;
-            println!(
-                "[EXAMPLE] force compact {} to {}",
-                region,
-                state.last_index - 7
-            );
-        }
+        // glommio::yield_if_needed().await;
     }
 }

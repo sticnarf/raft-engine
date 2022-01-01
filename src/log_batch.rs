@@ -694,7 +694,7 @@ impl LogBatch {
         }
 
         self.buf_state = BufState::Sealed(header_offset, footer_roffset - LOG_BATCH_HEADER_LEN);
-        Ok(real_len)
+        Ok(padded_len)
     }
 
     pub(crate) fn encoded_bytes(&self) -> &[u8] {
@@ -761,6 +761,9 @@ impl LogBatch {
         let len = codec::decode_u64(buf)? as usize;
         let offset = codec::decode_u64(buf)? as usize;
         let compression_type = CompressionType::from_u8(len as u8)?;
+        if len == 0 && offset == 0 {
+            return Ok((offset, CompressionType::None, 0));
+        }
         if offset > len {
             return Err(Error::Corruption(
                 "Log item offset exceeds log batch length".to_owned(),
