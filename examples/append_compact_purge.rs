@@ -41,7 +41,7 @@ fn main() {
             .unwrap();
         handles.push(handle);
     }
-    let purge = LocalExecutorBuilder::new(Placement::Fixed(0))
+    let purge = LocalExecutorBuilder::new(Placement::Unbound)
         .spawn(move || async move {
             loop {
                 for region in engine.purge_expired_files().unwrap() {
@@ -84,7 +84,7 @@ async fn run(engine: Arc<Engine>) {
         last_index: 0,
         ..Default::default()
     };
-    let sem = Rc::new(Semaphore::new(65536));
+    let sem = Rc::new(Semaphore::new(256));
     loop {
         let acquire_begin = Instant::now();
         let permit = Semaphore::acquire_static_permit(&sem, 1).await.unwrap();
