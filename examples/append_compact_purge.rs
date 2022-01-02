@@ -34,7 +34,7 @@ fn main() {
     };
     let engine = Arc::new(Engine::open(config).expect("Open raft engine"));
     let mut handles = Vec::new();
-    for i in 0..2 {
+    for _ in 0..2 {
         let engine = engine.clone();
         let handle = LocalExecutorBuilder::new(Placement::Unbound)
             .spawn(move || run(engine))

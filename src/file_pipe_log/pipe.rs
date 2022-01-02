@@ -3,20 +3,16 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use async_lock::Mutex as AsyncMutex;
 use crossbeam::utils::CachePadded;
 use fail::fail_point;
 use fs2::FileExt;
-use futures_lite::future::block_on;
-use glommio::io::{DmaFile, OpenOptions};
-use libc::*;
-use log::{error, info, warn};
-use parking_lot::RwLock;
+use glommio::io::DmaFile;
+use log::{error, warn};
+use parking_lot::{Mutex, RwLock};
 
 use crate::config::Config;
 use crate::event_listener::EventListener;
@@ -54,12 +50,12 @@ pub struct SinglePipe<B: FileBuilder> {
     listeners: Vec<Arc<dyn EventListener>>,
 
     files: CachePadded<RwLock<FileCollection>>,
-    active_file: CachePadded<AsyncMutex<ActiveFile<B>>>,
+    active_file: CachePadded<Mutex<ActiveFile<B>>>,
 }
 
 impl<B: FileBuilder> Drop for SinglePipe<B> {
     fn drop(&mut self) {
-        let mut active_file = block_on(self.active_file.lock());
+        let mut active_file = self.active_file.lock();
         if let Err(e) = active_file.writer.close() {
             error!("error while closing sigle pipe: {}", e);
         }
@@ -125,7 +121,7 @@ impl<B: FileBuilder> SinglePipe<B> {
                 active_seq,
                 fds,
             })),
-            active_file: CachePadded::new(AsyncMutex::new(active_file)),
+            active_file: CachePadded::new(Mutex::new(active_file)),
         };
         pipe.flush_metrics(total_files);
         Ok(pipe)
@@ -209,7 +205,7 @@ impl<B: FileBuilder> SinglePipe<B> {
 
     fn append(&self, bytes: &[u8]) -> Result<FileBlockHandle> {
         fail_point!("file_pipe_log::append");
-        let mut active_file = block_on(self.active_file.lock());
+        let mut active_file = self.active_file.lock();
         let seq = active_file.seq;
         let writer = &mut active_file.writer;
 
@@ -237,65 +233,8 @@ impl<B: FileBuilder> SinglePipe<B> {
         Ok(handle)
     }
 
-    pub async fn append_async(&self, bytes: &[u8]) -> Result<FileBlockHandle> {
-        let lock_begin = Instant::now();
-        let mut active_file = self.active_file.lock().await;
-        let lock_elapsed = lock_begin.elapsed();
-        if lock_elapsed > Duration::from_millis(100) {
-            warn!(
-                "lock active file too long: {:?}, {}",
-                lock_elapsed, active_file.seq
-            );
-        }
-        let seq = active_file.seq;
-        let file = DMA_FILE.with(|file| file.borrow().clone());
-
-        async fn open_file(seq: u64, path: &Path) -> Result<Rc<DmaFile>> {
-            let file = Rc::new(
-                OpenOptions::new()
-                    .write(true)
-                    .custom_flags(O_DSYNC)
-                    .dma_open(path)
-                    .await?,
-            );
-            DMA_FILE.with(|cell| *cell.borrow_mut() = Some((seq, file.clone())));
-            Ok(file)
-        }
-
-        let file = match file {
-            Some((curr_seq, file)) if seq == curr_seq => file,
-            Some((_, file)) => {
-                DMA_FILE.with(|cell| *cell.borrow_mut() = None);
-                file.close_rc().await?;
-                open_file(seq, &active_file.path).await?
-            }
-            None => open_file(seq, &active_file.path).await?,
-        };
-        let start_offset = active_file.writer.written as u64;
-        let padded_len = (bytes.len() + 4095) / 4096 * 4096;
-        active_file.writer.written += padded_len;
-        drop(active_file);
-
-        let mut buf = file.alloc_dma_buffer(padded_len);
-        buf.as_bytes_mut()[..bytes.len()].copy_from_slice(bytes);
-        file.write_at(buf, start_offset).await?;
-
-        let handle = FileBlockHandle {
-            id: FileId {
-                queue: self.queue,
-                seq,
-            },
-            offset: start_offset,
-            len: padded_len,
-        };
-        for listener in &self.listeners {
-            listener.on_append_log_file(handle);
-        }
-        Ok(handle)
-    }
-
     fn maybe_sync(&self, force: bool) -> Result<()> {
-        let mut active_file = block_on(self.active_file.lock());
+        let mut active_file = self.active_file.lock();
         let seq = active_file.seq;
         let writer = &mut active_file.writer;
         if writer.offset() >= self.target_file_size {
@@ -305,19 +244,6 @@ impl<B: FileBuilder> SinglePipe<B> {
         } else if writer.since_last_sync() >= self.bytes_per_sync || force {
             if let Err(e) = writer.sync() {
                 panic!("error when sync [{:?}:{}]: {}", self.queue, seq, e,);
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn maybe_rotate_async(&self) -> Result<()> {
-        let mut active_file = self.active_file.lock().await;
-        let seq = active_file.seq;
-        let writer = &mut active_file.writer;
-        if writer.offset() >= self.target_file_size {
-            if let Err(e) = self.rotate_imp(&mut active_file) {
-                panic!("error when rotate [{:?}:{}]: {}", self.queue, seq, e);
             }
         }
 
@@ -335,7 +261,7 @@ impl<B: FileBuilder> SinglePipe<B> {
     }
 
     fn rotate(&self) -> Result<()> {
-        self.rotate_imp(&mut *block_on(self.active_file.lock()))
+        self.rotate_imp(&mut *self.active_file.lock())
     }
 
     fn purge_to(&self, file_seq: FileSeq) -> Result<usize> {

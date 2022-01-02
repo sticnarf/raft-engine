@@ -1,14 +1,11 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     fs,
-    mem::{self, MaybeUninit},
-    ops::Deref,
     rc::Rc,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    thread,
 };
 
 use crossbeam::utils::CachePadded;
@@ -19,8 +16,8 @@ use glommio::{
     sync::Gate,
 };
 use libc::*;
-use log::{debug, warn};
-use parking_lot::{Mutex, RwLock};
+use log::warn;
+use parking_lot::RwLock;
 
 use crate::{
     file_builder::DefaultFileBuilder, Config, Error, FileBlockHandle, FileId, FileSeq, LogQueue,
