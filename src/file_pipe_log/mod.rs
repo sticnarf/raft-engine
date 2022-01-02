@@ -7,7 +7,6 @@ mod pipe;
 mod pipe_builder;
 mod reader;
 
-pub use async_pipe::WRITING_SEQS;
 pub use format::FileNameExt;
 pub use pipe::DualPipes as FilePipeLog;
 pub use pipe_builder::{DualPipesBuilder as FilePipeLogBuilder, ReplayMachine};

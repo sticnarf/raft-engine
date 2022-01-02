@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs,
     mem::{self, MaybeUninit},
     ops::Deref,
@@ -13,8 +13,11 @@ use std::{
 
 use crossbeam::utils::CachePadded;
 use futures_lite::Future;
-use glommio::io::{DmaFile, OpenOptions};
 use glommio::sync::RwLock as GRwLock;
+use glommio::{
+    io::{DmaFile, OpenOptions},
+    sync::Gate,
+};
 use libc::*;
 use log::{debug, warn};
 use parking_lot::{Mutex, RwLock};
@@ -31,15 +34,15 @@ use super::{
 };
 
 thread_local! {
-    static DMA_FILE: Rc<GRwLock<Option<(FileSeq, RcFile)>>> = Rc::new(GRwLock::new(None));
+    static DMA_FILES: Rc<GRwLock<BTreeMap<FileSeq, (Gate, Rc<DmaFile>)>>> = Rc::new(GRwLock::new(Default::default()));
 }
 
 const PAGE_SIZE: u64 = 4096;
 const FILE_PAGE_COUNT: u64 = 32798;
 
-lazy_static! {
-    pub static ref WRITING_SEQS: CachePadded<Mutex<BTreeMap<FileSeq, usize>>> = Default::default();
-}
+// lazy_static! {
+//     pub static ref WRITING_SEQS: CachePadded<Mutex<BTreeMap<FileSeq, usize>>> = Default::default();
+// }
 
 pub struct AsyncPipe {
     dir: String,
@@ -98,24 +101,23 @@ impl AsyncPipe {
         Ok(pipe)
     }
 
-    async fn open_file(&self, seq: u64) -> Result<RcFile> {
+    async fn open_file(&self, seq: u64) -> Result<Rc<DmaFile>> {
         let file_id = FileId {
             queue: LogQueue::Append,
             seq,
         };
         let path = file_id.build_file_path(&self.dir);
-        Ok(RcFile::new(
-            seq,
+        Ok(Rc::new(
             OpenOptions::new()
                 .write(true)
                 .create(true)
-                // .custom_flags(O_DSYNC)
+                .custom_flags(O_DSYNC)
                 .dma_open(&path)
                 .await?,
         ))
     }
 
-    fn create_file(&self, seq: u64) -> impl Future<Output = Result<RcFile>> {
+    fn create_file(&self, seq: u64) -> impl Future<Output = Result<()>> {
         let file_id = FileId {
             queue: LogQueue::Append,
             seq,
@@ -123,8 +125,7 @@ impl AsyncPipe {
         let path = file_id.build_file_path(&self.dir);
         let files = self.files.clone();
         async move {
-            let file = RcFile::new(
-                seq,
+            let file = Rc::new(
                 OpenOptions::new()
                     .write(true)
                     .create(true)
@@ -139,11 +140,12 @@ impl AsyncPipe {
             LogFileHeader::default().encode(&mut header)?;
             buf.as_bytes_mut().copy_from_slice(&header);
             file.write_at(buf, 0).await?;
+            file.close_rc().await?;
 
             let fd = Arc::new(LogFd::open(&path)?);
             files.write().fds.push_back(fd);
 
-            Ok(file)
+            Ok(())
         }
     }
 
@@ -180,30 +182,33 @@ impl AsyncPipe {
     pub async fn append_async(&self, bytes: &[u8]) -> Result<FileBlockHandle> {
         assert!(bytes.len() & 4095 == 0);
 
-        let curr_file = DMA_FILE.with(|cell| cell.clone());
-        let mut guard = curr_file.write().await.unwrap();
+        let dma_files = DMA_FILES.with(|lock| lock.clone());
+        let mut dma_files = dma_files.write().await.unwrap();
         let (seq, offset) = self.allocate(bytes.len())?;
-        let file = match &*guard {
-            Some((curr_seq, file)) if seq == *curr_seq => file.clone(),
-            Some(_) => {
-                let file = self.open_file(seq).await?;
-                *guard = Some((seq, file.clone()));
-                debug!("thread {:?} open file {}", thread::current().id(), seq);
-                file
+        let (_pass, file) = if let Some((gate, file)) = dma_files.get(&seq) {
+            (gate.enter().unwrap(), file.clone())
+        } else {
+            let min_allowed = seq.saturating_sub(2);
+            let should_be_closed = dma_files
+                .range(..min_allowed)
+                .map(|(seq, _)| *seq)
+                .collect::<Vec<_>>();
+            for seq in should_be_closed {
+                let (gate, file) = dma_files.remove(&seq).unwrap();
+                gate.close().await.unwrap();
+                file.close_rc().await.unwrap();
             }
-            None => {
-                let file = self.open_file(seq).await?;
-                *guard = Some((seq, file.clone()));
-                debug!("thread {:?} open file {}", thread::current().id(), seq);
-                file
-            }
+            let file = self.open_file(seq).await?;
+            let gate = Gate::new();
+            dma_files.insert(seq, (gate.clone(), file.clone()));
+            (gate.enter().unwrap(), file)
         };
-        drop(guard);
+        drop(dma_files);
 
         let mut buf = file.alloc_dma_buffer(bytes.len());
         buf.as_bytes_mut()[..bytes.len()].copy_from_slice(bytes);
         file.write_at(buf, offset).await?;
-        file.fdatasync().await?;
+        // file.fdatasync().await?;
 
         let handle = FileBlockHandle {
             id: FileId {
@@ -278,53 +283,53 @@ struct FileCollection {
     fds: VecDeque<Arc<LogFd>>,
 }
 
-struct RcFile(FileSeq, MaybeUninit<Rc<DmaFile>>);
+// struct RcFile(FileSeq, MaybeUninit<Rc<DmaFile>>);
 
-impl RcFile {
-    fn new(seq: FileSeq, file: DmaFile) -> RcFile {
-        *WRITING_SEQS.lock().entry(seq).or_insert(0) += 1;
-        RcFile(seq, MaybeUninit::new(Rc::new(file)))
-    }
-}
+// impl RcFile {
+//     fn new(seq: FileSeq, file: DmaFile) -> RcFile {
+//         *WRITING_SEQS.lock().entry(seq).or_insert(0) += 1;
+//         RcFile(seq, MaybeUninit::new(Rc::new(file)))
+//     }
+// }
 
-impl Clone for RcFile {
-    fn clone(&self) -> RcFile {
-        unsafe { RcFile(self.0, MaybeUninit::new(self.1.assume_init_ref().clone())) }
-    }
-}
+// impl Clone for RcFile {
+//     fn clone(&self) -> RcFile {
+//         unsafe { RcFile(self.0, MaybeUninit::new(self.1.assume_init_ref().clone())) }
+//     }
+// }
 
-impl Deref for RcFile {
-    type Target = DmaFile;
+// impl Deref for RcFile {
+//     type Target = DmaFile;
 
-    fn deref(&self) -> &DmaFile {
-        unsafe { self.1.assume_init_ref() }
-    }
-}
+//     fn deref(&self) -> &DmaFile {
+//         unsafe { self.1.assume_init_ref() }
+//     }
+// }
 
-impl Drop for RcFile {
-    fn drop(&mut self) {
-        let file = unsafe { mem::replace(&mut self.1, MaybeUninit::uninit()).assume_init() };
-        if let Ok(file) = Rc::try_unwrap(file) {
-            let seq = self.0;
-            glommio::spawn_local(async move {
-                let _ = file.close().await;
-                {
-                    let mut seqs = WRITING_SEQS.lock();
-                    let v = seqs.get_mut(&seq).unwrap();
-                    debug!(
-                        "thread {:?} remove file seq {}",
-                        thread::current().id(),
-                        seq
-                    );
-                    if *v == 1 {
-                        debug!("remove file seq {}", seq);
-                        seqs.remove(&seq);
-                    } else {
-                        *v -= 1;
-                    }
-                }
-            })
-            .detach();
-        }
-    }
-}
+// impl Drop for RcFile {
+//     fn drop(&mut self) {
+//         let file = unsafe { mem::replace(&mut self.1, MaybeUninit::uninit()).assume_init() };
+//         if let Ok(file) = Rc::try_unwrap(file) {
+//             let seq = self.0;
+//             glommio::spawn_local(async move {
+//                 let _ = file.close().await;
+//                 {
+//                     let mut seqs = WRITING_SEQS.lock();
+//                     let v = seqs.get_mut(&seq).unwrap();
+//                     debug!(
+//                         "thread {:?} remove file seq {}",
+//                         thread::current().id(),
+//                         seq
+//                     );
+//                     if *v == 1 {
+//                         debug!("remove file seq {}", seq);
+//                         seqs.remove(&seq);
+//                     } else {
+//                         *v -= 1;
+//                     }
+//                 }
+//             })
+//             .detach();
+//         }
+//     }
+// }

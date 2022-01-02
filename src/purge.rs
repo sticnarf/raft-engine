@@ -170,20 +170,19 @@ where
             // Can't rewrite or force compact the active file.
             return (None, None);
         }
-        let oldest = crate::file_pipe_log::WRITING_SEQS
-            .lock()
-            .iter()
-            .next()
-            .map(|(seq, _)| *seq)
-            .unwrap_or(u64::MAX);
-        let active_file = std::cmp::min(active_file, oldest);
 
         let rewrite_watermark = self.pipe_log.file_at(queue, REWRITE_RATIO);
         let compact_watermark = self.pipe_log.file_at(queue, FORCE_COMPACT_RATIO);
         debug_assert!(active_file - 1 > 0);
         (
-            Some(std::cmp::min(rewrite_watermark, active_file - 1)),
-            Some(std::cmp::min(compact_watermark, active_file - 1)),
+            Some(std::cmp::min(
+                rewrite_watermark,
+                active_file.saturating_sub(2),
+            )),
+            Some(std::cmp::min(
+                compact_watermark,
+                active_file.saturating_sub(2),
+            )),
         )
     }
 
