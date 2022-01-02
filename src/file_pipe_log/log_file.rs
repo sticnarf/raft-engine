@@ -354,10 +354,6 @@ impl<B: FileBuilder> LogFileReader<B> {
     pub fn read(&mut self, handle: FileBlockHandle) -> Result<Vec<u8>> {
         let mut buf = vec![0; handle.len];
         let size = self.read_to(handle.offset, &mut buf)?;
-        if size < handle.len {
-            debug!("{:?}", handle);
-            std::process::exit(1);
-        }
         buf.truncate(size);
         Ok(buf)
     }

@@ -130,7 +130,7 @@ impl AsyncPipe {
                     .dma_open(&path)
                     .await?,
             );
-            // file.pre_allocate(PAGE_SIZE * FILE_PAGE_COUNT).await?;
+            file.pre_allocate(PAGE_SIZE * FILE_PAGE_COUNT).await?;
             let mut buf = file.alloc_dma_buffer(4096);
             // FIXME(sticnarf): optimize
             let mut header = Vec::with_capacity(LogFileHeader::len());
@@ -205,7 +205,6 @@ impl AsyncPipe {
         let mut buf = file.alloc_dma_buffer(bytes.len());
         buf.as_bytes_mut()[..bytes.len()].copy_from_slice(bytes);
         file.write_at(buf, offset).await?;
-        // file.fdatasync().await?;
 
         let handle = FileBlockHandle {
             id: FileId {
