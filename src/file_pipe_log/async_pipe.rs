@@ -85,6 +85,8 @@ impl AsyncPipe {
             };
             let reserved = LogFd::create(&reserved_file_id.build_file_path(&cfg.dir))?;
             reserved.write(0, &header)?;
+            let fd = Arc::new(LogFd::create(&reserved_file_id.build_file_path(&cfg.dir))?);
+            fds.push_back(fd);
         }
 
         let pipe = Self {
