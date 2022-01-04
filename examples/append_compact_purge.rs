@@ -34,10 +34,10 @@ fn main() {
     };
     let engine = Arc::new(Engine::open(config).expect("Open raft engine"));
     let mut handles = Vec::new();
-    for _ in 0..2 {
+    for i in 0..2 {
         let engine = engine.clone();
         let handle = LocalExecutorBuilder::new(Placement::Unbound)
-            .spawn(move || run(engine))
+            .spawn(move || run(engine, i == 0))
             .unwrap();
         handles.push(handle);
     }
@@ -66,7 +66,7 @@ fn main() {
     purge.join().unwrap();
 }
 
-async fn run(engine: Arc<Engine>) {
+async fn run(engine: Arc<Engine>, compact: bool) {
     let compact_offset = 32; // In src/purge.rs, it's the limit for rewrite.
 
     let mut rand_regions = Normal::new(128.0, 96.0)
@@ -115,7 +115,7 @@ async fn run(engine: Arc<Engine>) {
 
         // engine.write(&mut batch, true).unwrap();
 
-        if state.last_index % compact_offset == 0 {
+        if compact && state.last_index % compact_offset == 0 {
             let rand_compact_offset = rand_compacts.next().unwrap();
             if state.last_index > rand_compact_offset {
                 let compact_to = state.last_index - rand_compact_offset;

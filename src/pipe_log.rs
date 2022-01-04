@@ -46,7 +46,7 @@ impl std::cmp::PartialOrd for FileId {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct FileBlockHandle {
     pub id: FileId,
     pub offset: u64,

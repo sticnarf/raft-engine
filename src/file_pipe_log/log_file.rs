@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use fail::fail_point;
-use log::{debug, error};
+use log::error;
 use nix::errno::Errno;
 use nix::fcntl::{self, OFlag};
 use nix::sys::stat::Mode;
