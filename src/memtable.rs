@@ -311,7 +311,7 @@ impl MemTable {
     fn unsafe_truncate_back(&mut self, first: u64, index: u64, last: u64) -> usize {
         debug_assert!(index <= last);
         let len = self.entry_indexes.len();
-        debug_assert_eq!(len as u64, last - first + 1);
+        // debug_assert_eq!(len as u64, last - first + 1);
         self.entry_indexes.split_off(&index);
         let new_len = self.entry_indexes.len();
         let truncated = len - new_len;
