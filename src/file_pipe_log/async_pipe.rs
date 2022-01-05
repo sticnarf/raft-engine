@@ -53,46 +53,37 @@ impl AsyncPipe {
         mut first_seq: FileSeq,
         mut fds: VecDeque<Arc<LogFd>>,
     ) -> Result<Self> {
-        let create_file = first_seq == 0;
-        let active_seq = if create_file {
-            first_seq = 1;
-            let file_id = FileId {
-                queue: LogQueue::Append,
-                seq: first_seq,
-            };
-            let fd = Arc::new(LogFd::create(&file_id.build_file_path(&cfg.dir))?);
-            fds.push_back(fd);
-            first_seq
-        } else {
-            first_seq + fds.len() as u64 - 1
+        // always create a new file
+        let seq = std::cmp::max(first_seq + fds.len() as u64, 1);
+        let file_id = FileId {
+            queue: LogQueue::Append,
+            seq,
         };
-        let active_file_size = fds.back().unwrap().file_size()? as u64;
-        let mut active_page = active_file_size / PAGE_SIZE;
-        // create header if necessary
+        let fd = Arc::new(LogFd::create(&file_id.build_file_path(&cfg.dir))?);
+        fd.allocate(0, (PAGE_SIZE * FILE_PAGE_COUNT) as usize)?;
+        fds.push_back(fd);
+        // create header for the new file.
         let mut header = Vec::with_capacity(LogFileHeader::len());
         LogFileHeader::default().encode(&mut header)?;
-        if active_page == 0 {
-            fds.back().unwrap().write(0, &header)?;
-            active_page = 1;
-        }
-        let seq_page = CachePadded::new(AtomicU64::new(active_seq << 16 | active_page));
+        fds.back().unwrap().write(0, &header)?;
+        let seq_page = CachePadded::new(AtomicU64::new(seq << 16 | 1));
 
         // create one more reserved file
         {
             let reserved_file_id = FileId {
                 queue: LogQueue::Append,
-                seq: active_seq + 1,
+                seq: seq + 1,
             };
-            let reserved = LogFd::create(&reserved_file_id.build_file_path(&cfg.dir))?;
+            let reserved = Arc::new(LogFd::create(&reserved_file_id.build_file_path(&cfg.dir))?);
+            reserved.allocate(0, (PAGE_SIZE * FILE_PAGE_COUNT) as usize)?;
             reserved.write(0, &header)?;
-            let fd = Arc::new(LogFd::create(&reserved_file_id.build_file_path(&cfg.dir))?);
-            fds.push_back(fd);
+            fds.push_back(reserved);
         }
 
         let pipe = Self {
             dir: cfg.dir.clone(),
             files: Arc::new(CachePadded::new(RwLock::new(FileCollection {
-                first_seq,
+                first_seq: std::cmp::max(first_seq, 1),
                 fds,
             }))),
             seq_page,
@@ -192,11 +183,16 @@ impl AsyncPipe {
                 .range(..min_allowed)
                 .map(|(seq, _)| *seq)
                 .collect::<Vec<_>>();
+
             for seq in should_be_closed {
                 let (gate, file) = dma_files.remove(&seq).unwrap();
-                gate.close().await.unwrap();
-                file.close_rc().await.unwrap();
+                glommio::spawn_local(async move {
+                    gate.close().await.unwrap();
+                    file.close_rc().await.unwrap();
+                })
+                .detach();
             }
+
             let file = self.open_file(seq).await?;
             let gate = Gate::new();
             dma_files.insert(seq, (gate.clone(), file.clone()));

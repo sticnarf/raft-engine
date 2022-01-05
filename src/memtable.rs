@@ -341,10 +341,10 @@ impl MemTable {
                 if allow_overwrite_compacted {
                     self.unsafe_truncate_back(first, 0, last);
                 } else {
-                    panic!(
-                        "attempt to overwrite compacted entries in {}",
-                        self.region_id
-                    );
+                    // panic!(
+                    //     "attempt to overwrite compacted entries in {}",
+                    //     self.region_id
+                    // );
                 }
             } else if last + 1 < first_index_to_add {
                 if truncate_after_hole {
