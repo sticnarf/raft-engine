@@ -1,5 +1,6 @@
 // Copyright (c) 2017-present, PingCAP, Inc. Licensed under Apache-2.0.
 
+mod async_pipe;
 mod format;
 mod log_file;
 mod pipe;

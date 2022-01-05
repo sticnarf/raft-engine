@@ -1,15 +1,18 @@
 // Copyright (c) 2017-present, PingCAP, Inc. Licensed under Apache-2.0.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crossbeam::utils::CachePadded;
 use fail::fail_point;
 use fs2::FileExt;
+use glommio::io::DmaFile;
 use log::{error, warn};
-use parking_lot::{Mutex, MutexGuard, RwLock};
+use parking_lot::{Mutex, RwLock};
 
 use crate::config::Config;
 use crate::event_listener::EventListener;
@@ -18,6 +21,7 @@ use crate::metrics::*;
 use crate::pipe_log::{FileBlockHandle, FileId, FileSeq, LogQueue, PipeLog};
 use crate::{Error, Result};
 
+use super::async_pipe::AsyncPipe;
 use super::format::{lock_file_path, FileNameExt};
 use super::log_file::{build_file_reader, build_file_writer, LogFd, LogFileWriter};
 
@@ -29,7 +33,12 @@ struct FileCollection {
 
 struct ActiveFile<B: FileBuilder> {
     seq: FileSeq,
+    path: PathBuf,
     writer: LogFileWriter<B>,
+}
+
+thread_local! {
+    static DMA_FILE: RefCell<Option<(FileSeq, Rc<DmaFile>)>> = RefCell::new(None);
 }
 
 pub struct SinglePipe<B: FileBuilder> {
@@ -89,6 +98,7 @@ impl<B: FileBuilder> SinglePipe<B> {
         };
         let active_file = ActiveFile {
             seq: active_seq,
+            path: file_id.build_file_path(&cfg.dir),
             writer: build_file_writer(
                 file_builder.as_ref(),
                 &file_id.build_file_path(&cfg.dir),
@@ -131,7 +141,7 @@ impl<B: FileBuilder> SinglePipe<B> {
         Ok(files.fds[(file_seq - files.first_seq) as usize].clone())
     }
 
-    fn rotate_imp(&self, active_file: &mut MutexGuard<ActiveFile<B>>) -> Result<()> {
+    fn rotate_imp(&self, active_file: &mut ActiveFile<B>) -> Result<()> {
         let _t = StopWatch::new(&LOG_ROTATE_DURATION_HISTOGRAM);
         let seq = active_file.seq + 1;
         debug_assert!(seq > 1);
@@ -145,6 +155,7 @@ impl<B: FileBuilder> SinglePipe<B> {
         self.sync_dir()?;
         let new_file = ActiveFile {
             seq,
+            path: path.clone(),
             writer: build_file_writer(
                 self.file_builder.as_ref(),
                 &path,
@@ -154,7 +165,7 @@ impl<B: FileBuilder> SinglePipe<B> {
         };
 
         active_file.writer.close()?;
-        **active_file = new_file;
+        *active_file = new_file;
 
         let len = {
             let mut files = self.files.write();
@@ -250,7 +261,7 @@ impl<B: FileBuilder> SinglePipe<B> {
     }
 
     fn rotate(&self) -> Result<()> {
-        self.rotate_imp(&mut self.active_file.lock())
+        self.rotate_imp(&mut *self.active_file.lock())
     }
 
     fn purge_to(&self, file_seq: FileSeq) -> Result<usize> {
@@ -290,13 +301,14 @@ impl<B: FileBuilder> SinglePipe<B> {
 }
 
 pub struct DualPipes<B: FileBuilder> {
-    pipes: [SinglePipe<B>; 2],
+    pub appender: AsyncPipe,
+    pub rewriter: SinglePipe<B>,
 
     _lock_file: File,
 }
 
 impl<B: FileBuilder> DualPipes<B> {
-    pub fn open(dir: &str, appender: SinglePipe<B>, rewriter: SinglePipe<B>) -> Result<Self> {
+    pub fn open(dir: &str, appender: AsyncPipe, rewriter: SinglePipe<B>) -> Result<Self> {
         let lock_file = File::create(lock_file_path(dir))?;
         lock_file.try_lock_exclusive().map_err(|e| {
             Error::Other(box_err!(
@@ -309,164 +321,67 @@ impl<B: FileBuilder> DualPipes<B> {
         debug_assert_eq!(LogQueue::Append as usize, 0);
         debug_assert_eq!(LogQueue::Rewrite as usize, 1);
         Ok(Self {
-            pipes: [appender, rewriter],
+            appender,
+            rewriter,
             _lock_file: lock_file,
         })
-    }
-
-    #[cfg(test)]
-    pub fn file_builder(&self) -> Arc<B> {
-        self.pipes[0].file_builder.clone()
     }
 }
 
 impl<B: FileBuilder> PipeLog for DualPipes<B> {
     #[inline]
     fn read_bytes(&self, handle: FileBlockHandle) -> Result<Vec<u8>> {
-        self.pipes[handle.id.queue as usize].read_bytes(handle)
+        match handle.id.queue {
+            LogQueue::Append => self.appender.read_bytes(handle),
+            LogQueue::Rewrite => self.rewriter.read_bytes(handle),
+        }
     }
 
     #[inline]
     fn append(&self, queue: LogQueue, bytes: &[u8]) -> Result<FileBlockHandle> {
-        self.pipes[queue as usize].append(bytes)
+        match queue {
+            LogQueue::Append => todo!(),
+            LogQueue::Rewrite => self.rewriter.append(bytes),
+        }
     }
 
     #[inline]
     fn maybe_sync(&self, queue: LogQueue, force: bool) -> Result<()> {
-        self.pipes[queue as usize].maybe_sync(force)
+        match queue {
+            LogQueue::Append => todo!(),
+            LogQueue::Rewrite => self.rewriter.maybe_sync(force),
+        }
     }
 
     #[inline]
     fn file_span(&self, queue: LogQueue) -> (FileSeq, FileSeq) {
-        self.pipes[queue as usize].file_span()
+        match queue {
+            LogQueue::Append => self.appender.file_span(),
+            LogQueue::Rewrite => self.rewriter.file_span(),
+        }
     }
 
     #[inline]
     fn total_size(&self, queue: LogQueue) -> usize {
-        self.pipes[queue as usize].total_size()
+        match queue {
+            LogQueue::Append => self.appender.total_size(),
+            LogQueue::Rewrite => self.rewriter.total_size(),
+        }
     }
 
     #[inline]
     fn rotate(&self, queue: LogQueue) -> Result<()> {
-        self.pipes[queue as usize].rotate()
+        match queue {
+            LogQueue::Append => todo!(),
+            LogQueue::Rewrite => self.rewriter.rotate(),
+        }
     }
 
     #[inline]
     fn purge_to(&self, file_id: FileId) -> Result<usize> {
-        self.pipes[file_id.queue as usize].purge_to(file_id.seq)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use tempfile::Builder;
-
-    use super::super::format::LogFileHeader;
-    use super::*;
-    use crate::file_builder::DefaultFileBuilder;
-    use crate::util::ReadableSize;
-
-    fn new_test_pipe(cfg: &Config, queue: LogQueue) -> Result<SinglePipe<DefaultFileBuilder>> {
-        SinglePipe::open(
-            cfg,
-            Arc::new(DefaultFileBuilder),
-            Vec::new(),
-            queue,
-            0,
-            VecDeque::new(),
-        )
-    }
-
-    fn new_test_pipes(cfg: &Config) -> Result<DualPipes<DefaultFileBuilder>> {
-        DualPipes::open(
-            &cfg.dir,
-            new_test_pipe(cfg, LogQueue::Append)?,
-            new_test_pipe(cfg, LogQueue::Rewrite)?,
-        )
-    }
-
-    #[test]
-    fn test_dir_lock() {
-        let dir = Builder::new().prefix("test_dir_lock").tempdir().unwrap();
-        let path = dir.path().to_str().unwrap();
-        let cfg = Config {
-            dir: path.to_owned(),
-            ..Default::default()
-        };
-
-        let _r1 = new_test_pipes(&cfg).unwrap();
-
-        // Only one thread can hold file lock
-        let r2 = new_test_pipes(&cfg);
-
-        assert!(format!("{}", r2.err().unwrap())
-            .contains("maybe another instance is using this directory"));
-    }
-
-    #[test]
-    fn test_pipe_log() {
-        let dir = Builder::new().prefix("test_pipe_log").tempdir().unwrap();
-        let path = dir.path().to_str().unwrap();
-        let cfg = Config {
-            dir: path.to_owned(),
-            target_file_size: ReadableSize::kb(1),
-            bytes_per_sync: ReadableSize::kb(32),
-            ..Default::default()
-        };
-        let queue = LogQueue::Append;
-
-        let pipe_log = new_test_pipes(&cfg).unwrap();
-        assert_eq!(pipe_log.file_span(queue), (1, 1));
-
-        let header_size = LogFileHeader::len() as u64;
-
-        // generate file 1, 2, 3
-        let content: Vec<u8> = vec![b'a'; 1024];
-        let file_handle = pipe_log.append(queue, &content).unwrap();
-        pipe_log.maybe_sync(queue, false).unwrap();
-        assert_eq!(file_handle.id.seq, 1);
-        assert_eq!(file_handle.offset, header_size);
-        assert_eq!(pipe_log.file_span(queue).1, 2);
-
-        let file_handle = pipe_log.append(queue, &content).unwrap();
-        pipe_log.maybe_sync(queue, false).unwrap();
-        assert_eq!(file_handle.id.seq, 2);
-        assert_eq!(file_handle.offset, header_size);
-        assert_eq!(pipe_log.file_span(queue).1, 3);
-
-        // purge file 1
-        assert_eq!(pipe_log.purge_to(FileId { queue, seq: 2 }).unwrap(), 1);
-        assert_eq!(pipe_log.file_span(queue).0, 2);
-
-        // cannot purge active file
-        assert!(pipe_log.purge_to(FileId { queue, seq: 4 }).is_err());
-
-        // append position
-        let s_content = b"short content".to_vec();
-        let file_handle = pipe_log.append(queue, &s_content).unwrap();
-        pipe_log.maybe_sync(queue, false).unwrap();
-        assert_eq!(file_handle.id.seq, 3);
-        assert_eq!(file_handle.offset, header_size);
-
-        let file_handle = pipe_log.append(queue, &s_content).unwrap();
-        pipe_log.maybe_sync(queue, false).unwrap();
-        assert_eq!(file_handle.id.seq, 3);
-        assert_eq!(
-            file_handle.offset,
-            header_size as u64 + s_content.len() as u64
-        );
-
-        let content_readed = pipe_log
-            .read_bytes(FileBlockHandle {
-                id: FileId { queue, seq: 3 },
-                offset: header_size as u64,
-                len: s_content.len(),
-            })
-            .unwrap();
-        assert_eq!(content_readed, s_content);
-
-        // leave only 1 file to truncate
-        assert!(pipe_log.purge_to(FileId { queue, seq: 3 }).is_ok());
-        assert_eq!(pipe_log.file_span(queue), (3, 3));
+        match file_id.queue {
+            LogQueue::Append => self.appender.purge_to(file_id.seq),
+            LogQueue::Rewrite => self.rewriter.purge_to(file_id.seq),
+        }
     }
 }

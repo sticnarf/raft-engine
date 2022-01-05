@@ -27,6 +27,7 @@ const FILE_ALLOCATE_SIZE: usize = 2 * 1024 * 1024;
 ///
 /// This implementation is a thin wrapper around `RawFd`, and primarily targets
 /// UNIX-based systems.
+#[derive(Hash)]
 pub struct LogFd(RawFd);
 
 fn from_nix_error(e: nix::Error, custom: &'static str) -> std::io::Error {
@@ -238,7 +239,7 @@ pub struct LogFileWriter<B: FileBuilder> {
     fd: Arc<LogFd>,
     writer: B::Writer<LogFile>,
 
-    written: usize,
+    pub written: usize,
     capacity: usize,
     last_sync: usize,
 }
@@ -334,7 +335,7 @@ pub fn build_file_reader<B: FileBuilder>(
 
 /// Random-access reader for log file.
 pub struct LogFileReader<B: FileBuilder> {
-    fd: Arc<LogFd>,
+    pub fd: Arc<LogFd>,
     reader: B::Reader<LogFile>,
 
     offset: usize,

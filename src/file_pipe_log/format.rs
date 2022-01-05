@@ -16,7 +16,7 @@ const LOG_APPEND_SUFFIX: &str = ".raftlog";
 const LOG_REWRITE_SUFFIX: &str = ".rewrite";
 // File header.
 const LOG_FILE_MAGIC_HEADER: &[u8] = b"RAFT-LOG-FILE-HEADER-9986AB3E47F320B394C8E84916EB0ED5";
-const LOG_FILE_HEADER_LEN: usize = LOG_FILE_MAGIC_HEADER.len() + std::mem::size_of::<Version>();
+const LOG_FILE_HEADER_LEN: usize = 4096;
 
 pub trait FileNameExt: Sized {
     fn parse_file_name(file_name: &str) -> Option<Self>;
@@ -122,6 +122,7 @@ impl LogFileHeader {
     pub fn encode(&self, buf: &mut Vec<u8>) -> Result<()> {
         buf.extend_from_slice(LOG_FILE_MAGIC_HEADER);
         buf.encode_u64(self.version.to_u64().unwrap())?;
+        buf.resize(4096, 0);
         Ok(())
     }
 }

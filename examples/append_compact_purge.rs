@@ -1,6 +1,12 @@
-// Copyright (c) 2017-present, PingCAP, Inc. Licensed under Apache-2.0.
+use std::{
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
+use glommio::{sync::Semaphore, LocalExecutorBuilder, Placement};
 use kvproto::raft_serverpb::RaftLocalState;
+use log::debug;
 use raft::eraftpb::Entry;
 use raft_engine::{Config, Engine, LogBatch, MessageExt, ReadableSize};
 use rand::thread_rng;
@@ -17,8 +23,6 @@ impl MessageExt for MessageExtTyped {
     }
 }
 
-// How to run the example:
-// $ RUST_LOG=debug cargo run --release --example append-compact-purge
 fn main() {
     env_logger::init();
 
@@ -28,8 +32,41 @@ fn main() {
         batch_compression_threshold: ReadableSize::kb(0),
         ..Default::default()
     };
-    let engine = Engine::open(config).expect("Open raft engine");
+    let engine = Arc::new(Engine::open(config).expect("Open raft engine"));
+    let mut handles = Vec::new();
+    for i in 0..2 {
+        let engine = engine.clone();
+        let handle = LocalExecutorBuilder::new(Placement::Unbound)
+            .spawn(move || run(engine, i == 0))
+            .unwrap();
+        handles.push(handle);
+    }
+    let purge = LocalExecutorBuilder::new(Placement::Unbound)
+        .spawn(move || async move {
+            loop {
+                for region in engine.purge_expired_files().unwrap() {
+                    let state = engine
+                        .get_message::<RaftLocalState>(region, b"last_index")
+                        .unwrap()
+                        .unwrap();
+                    engine.compact_to_async(region, state.last_index - 7).await;
+                    println!(
+                        "[EXAMPLE] force compact {} to {}",
+                        region,
+                        state.last_index - 7
+                    );
+                }
+                glommio::timer::sleep(Duration::from_secs(1)).await;
+            }
+        })
+        .unwrap();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    purge.join().unwrap();
+}
 
+async fn run(engine: Arc<Engine>, compact: bool) {
     let compact_offset = 32; // In src/purge.rs, it's the limit for rewrite.
 
     let mut rand_regions = Normal::new(128.0, 96.0)
@@ -41,49 +78,55 @@ fn main() {
         .sample_iter(thread_rng())
         .map(|x| x as u64);
 
-    let mut batch = LogBatch::with_capacity(256);
     let mut entry = Entry::new();
-    entry.set_data(vec![b'x'; 1024 * 32].into());
+    entry.set_data(vec![b'x'; 17462].into());
     let init_state = RaftLocalState {
         last_index: 0,
         ..Default::default()
     };
+    let sem = Rc::new(Semaphore::new(256));
     loop {
-        for _ in 0..1024 {
-            let region = rand_regions.next().unwrap();
-            let state = engine
-                .get_message::<RaftLocalState>(region, b"last_index")
-                .unwrap()
-                .unwrap_or_else(|| init_state.clone());
+        let acquire_begin = Instant::now();
+        let permit = Semaphore::acquire_static_permit(&sem, 1).await.unwrap();
+        let acquire_elapsed = acquire_begin.elapsed();
+        if acquire_elapsed > Duration::from_millis(50) {
+            debug!("acquire elapsed {:?}", acquire_elapsed);
+        }
 
-            let mut e = entry.clone();
-            e.index = state.last_index + 1;
-            batch.add_entries::<MessageExtTyped>(region, &[e]).unwrap();
-            batch
-                .put_message(region, b"last_index".to_vec(), &state)
-                .unwrap();
-            engine.write(&mut batch, false).unwrap();
+        let mut batch = LogBatch::with_capacity(256);
+        let region = rand_regions.next().unwrap();
+        let state = engine
+            .get_message::<RaftLocalState>(region, b"last_index")
+            .unwrap()
+            .unwrap_or_else(|| init_state.clone());
 
-            if state.last_index % compact_offset == 0 {
-                let rand_compact_offset = rand_compacts.next().unwrap();
-                if state.last_index > rand_compact_offset {
-                    let compact_to = state.last_index - rand_compact_offset;
-                    engine.compact_to(region, compact_to);
+        let mut e = entry.clone();
+        e.index = state.last_index + 1;
+        batch.add_entries::<MessageExtTyped>(region, &[e]).unwrap();
+        batch
+            .put_message(region, b"last_index".to_vec(), &state)
+            .unwrap();
+        let engine2 = engine.clone();
+        glommio::spawn_local(async move {
+            engine2.write_async(&mut batch).await.unwrap();
+            drop(permit);
+        })
+        .detach();
+
+        // engine.write(&mut batch, true).unwrap();
+
+        if compact && state.last_index % compact_offset == 0 {
+            let rand_compact_offset = rand_compacts.next().unwrap();
+            if state.last_index > rand_compact_offset {
+                let compact_to = state.last_index - rand_compact_offset;
+                let engine2 = engine.clone();
+                glommio::spawn_local(async move {
+                    engine2.compact_to_async(region, compact_to).await;
                     println!("[EXAMPLE] compact {} to {}", region, compact_to);
-                }
+                })
+                .detach();
             }
         }
-        for region in engine.purge_expired_files().unwrap() {
-            let state = engine
-                .get_message::<RaftLocalState>(region, b"last_index")
-                .unwrap()
-                .unwrap();
-            engine.compact_to(region, state.last_index - 7);
-            println!(
-                "[EXAMPLE] force compact {} to {}",
-                region,
-                state.last_index - 7
-            );
-        }
+        // glommio::yield_if_needed().await;
     }
 }

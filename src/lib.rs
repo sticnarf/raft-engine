@@ -15,6 +15,8 @@
 #![feature(btree_drain_filter)]
 #![feature(generic_associated_types)]
 #![feature(test)]
+#![feature(backtrace)]
+#![feature(map_first_last)]
 
 #[macro_use]
 extern crate lazy_static;

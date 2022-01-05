@@ -12,7 +12,7 @@ pub enum LogQueue {
 
 pub type FileSeq = u64;
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct FileId {
     pub queue: LogQueue,
     pub seq: FileSeq,
@@ -46,7 +46,7 @@ impl std::cmp::PartialOrd for FileId {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct FileBlockHandle {
     pub id: FileId,
     pub offset: u64,

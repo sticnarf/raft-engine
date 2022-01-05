@@ -3,6 +3,7 @@
 use std::error;
 use std::io::Error as IoError;
 
+use glommio::GlommioError;
 use thiserror::Error;
 
 use crate::codec::Error as CodecError;
@@ -23,8 +24,16 @@ pub enum Error {
     EntryCompacted,
     #[error("Entry Not Found")]
     EntryNotFound,
+    #[error("Glommio error: {0}")]
+    Glommio(String),
     #[error("Other Error: {0}")]
     Other(#[from] Box<dyn error::Error + Send + Sync>),
+}
+
+impl<T> From<GlommioError<T>> for Error {
+    fn from(err: GlommioError<T>) -> Self {
+        Error::Glommio(format!("{}", err))
+    }
 }
 
 pub type Result<T> = ::std::result::Result<T, Error>;
