@@ -35,7 +35,9 @@ thread_local! {
 }
 
 const PAGE_SIZE: u64 = 4096;
-const FILE_PAGE_COUNT: u64 = 32798;
+const SEQ_SHIFT: u64 = 19;
+const FILE_PAGE_COUNT: u64 = 1 << (SEQ_SHIFT - 1); // 1GB
+const FILE_PAGE_MASK: u64 = (1 << SEQ_SHIFT) - 1;
 
 // lazy_static! {
 //     pub static ref WRITING_SEQS: CachePadded<Mutex<BTreeMap<FileSeq, usize>>> = Default::default();
@@ -48,11 +50,7 @@ pub struct AsyncPipe {
 }
 
 impl AsyncPipe {
-    pub fn open(
-        cfg: &Config,
-        mut first_seq: FileSeq,
-        mut fds: VecDeque<Arc<LogFd>>,
-    ) -> Result<Self> {
+    pub fn open(cfg: &Config, first_seq: FileSeq, mut fds: VecDeque<Arc<LogFd>>) -> Result<Self> {
         // always create a new file
         let seq = std::cmp::max(first_seq + fds.len() as u64, 1);
         let file_id = FileId {
@@ -66,7 +64,7 @@ impl AsyncPipe {
         let mut header = Vec::with_capacity(LogFileHeader::len());
         LogFileHeader::default().encode(&mut header)?;
         fds.back().unwrap().write(0, &header)?;
-        let seq_page = CachePadded::new(AtomicU64::new(seq << 16 | 1));
+        let seq_page = CachePadded::new(AtomicU64::new(seq << SEQ_SHIFT | 1));
 
         // create one more reserved file
         {
@@ -123,7 +121,9 @@ impl AsyncPipe {
                     .dma_open(&path)
                     .await?,
             );
-            file.pre_allocate(PAGE_SIZE * FILE_PAGE_COUNT).await?;
+            let file_size = PAGE_SIZE * FILE_PAGE_COUNT;
+            file.hint_extent_size(file_size as usize).await?;
+            file.pre_allocate(file_size).await?;
             let mut buf = file.alloc_dma_buffer(4096);
             // FIXME(sticnarf): optimize
             let mut header = Vec::with_capacity(LogFileHeader::len());
@@ -144,13 +144,13 @@ impl AsyncPipe {
         let inc = (len as u64 + PAGE_SIZE - 1) / PAGE_SIZE;
         let mut curr = self.seq_page.load(Ordering::Relaxed);
         loop {
-            let (seq, page) = (curr >> 16, curr & 0xffff);
+            let (seq, page) = (curr >> SEQ_SHIFT, curr & FILE_PAGE_MASK);
             let (res_seq, res_page) = if page + inc > FILE_PAGE_COUNT {
                 (seq + 1, 1) // 1 reserved for file header
             } else {
                 (seq, page)
             };
-            let new_seq_page = res_seq << 16 | (res_page + inc);
+            let new_seq_page = res_seq << SEQ_SHIFT | (res_page + inc);
             match self.seq_page.compare_exchange_weak(
                 curr,
                 new_seq_page,
@@ -216,7 +216,7 @@ impl AsyncPipe {
     }
 
     fn active_seq(&self) -> u64 {
-        self.seq_page.load(Ordering::Acquire) >> 16
+        self.seq_page.load(Ordering::Acquire) >> SEQ_SHIFT
     }
 
     pub fn file_span(&self) -> (FileSeq, FileSeq) {
