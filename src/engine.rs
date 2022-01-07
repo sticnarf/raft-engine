@@ -218,10 +218,20 @@ where
         if let Some(memtable) = self.memtables.get(region_id) {
             if let Some(idx) = memtable.read().get_entry(log_idx) {
                 ENGINE_READ_ENTRY_COUNT_HISTOGRAM.observe(1.0);
-                return Ok(Some(read_entry_from_file::<M, _>(
-                    self.pipe_log.as_ref(),
-                    &idx,
-                )?));
+                return Ok(Some(
+                    read_entry_from_file::<M, _>(self.pipe_log.as_ref(), &idx).map_err(|e| {
+                        error!(
+                            "failed to load entry from file, region {}, idx {}",
+                            region_id, log_idx
+                        );
+                        e
+                    })?,
+                ));
+            } else {
+                error!(
+                    "failed to find entry from memtable, region {}, idx {}",
+                    region_id, log_idx
+                );
             }
         }
         Ok(None)
