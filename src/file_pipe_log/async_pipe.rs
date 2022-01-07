@@ -101,7 +101,7 @@ impl AsyncPipe {
             OpenOptions::new()
                 .write(true)
                 .create(true)
-                .custom_flags(O_DSYNC)
+                // .custom_flags(O_DSYNC)
                 .dma_open(&path)
                 .await?,
         ))
@@ -119,7 +119,7 @@ impl AsyncPipe {
                 OpenOptions::new()
                     .write(true)
                     .create(true)
-                    .custom_flags(O_DSYNC)
+                    // .custom_flags(O_DSYNC)
                     .dma_open(&path)
                     .await?,
             );
