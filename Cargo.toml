@@ -42,7 +42,9 @@ rayon = "1.5"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 glommio = { git = "https://github.com/TPC-TiKV/glommio.git", branch = "tpc" }
+# glommio = { path = "/home/yilin/Code/glommio/glommio" }
 futures-lite = "1.12"
+# async-channel = "1"
 
 [dev-dependencies]
 criterion = "0.3"

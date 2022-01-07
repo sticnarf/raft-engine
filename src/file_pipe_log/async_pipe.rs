@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     fs,
+    path::PathBuf,
     rc::Rc,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -17,7 +18,7 @@ use glommio::{
 };
 use libc::*;
 use log::warn;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::{
     file_builder::DefaultFileBuilder, Config, Error, FileBlockHandle, FileId, FileSeq, LogQueue,
@@ -47,6 +48,7 @@ pub struct AsyncPipe {
     dir: String,
     files: Arc<CachePadded<RwLock<FileCollection>>>,
     seq_page: CachePadded<AtomicU64>,
+    free_list: CachePadded<Mutex<Vec<PathBuf>>>,
 }
 
 impl AsyncPipe {
@@ -85,6 +87,7 @@ impl AsyncPipe {
                 fds,
             }))),
             seq_page,
+            free_list: Default::default(),
         };
         Ok(pipe)
     }
@@ -95,24 +98,49 @@ impl AsyncPipe {
             seq,
         };
         let path = file_id.build_file_path(&self.dir);
-        Ok(Rc::new(
+        let file = Rc::new(
             OpenOptions::new()
                 .write(true)
                 .create(true)
-                // .custom_flags(O_DSYNC)
+                .custom_flags(O_DSYNC)
                 .dma_open(&path)
                 .await?,
-        ))
+        );
+        // file.hint_extent_size(16 << 10).await.unwrap();
+        Ok(file)
     }
 
-    fn create_file(&self, seq: u64) -> impl Future<Output = Result<()>> {
+    fn create_file(&self, seq: u64) -> Result<impl Future<Output = Result<()>>> {
         let file_id = FileId {
             queue: LogQueue::Append,
             seq,
         };
         let path = file_id.build_file_path(&self.dir);
+        {
+            let mut free_list = self.free_list.lock();
+            if let Some(deleted) = free_list.pop() {
+                fs::rename(&deleted, &path)?;
+                drop(free_list);
+                let fd = Arc::new(LogFd::open(&path)?);
+                self.files.write().fds.push_back(fd);
+            }
+        }
+        // let mut cmd = Command::new("dd")
+        //     .arg("if=/dev/zero")
+        //     .arg(format!("of={}", path.to_string_lossy()))
+        //     .arg("bs=16M")
+        //     .arg("count=64")
+        //     .arg("oflag=dsync")
+        //     .spawn()
+        //     .unwrap();
+        // let (tx, rx) = async_channel::bounded(1);
+        // thread::spawn(move || {
+        //     cmd.wait().ok();
+        //     tx.try_send(()).ok();
+        // });
         let files = self.files.clone();
-        async move {
+        let fut = async move {
+            // rx.recv().await.ok();
             let file = Rc::new(
                 OpenOptions::new()
                     .write(true)
@@ -122,8 +150,16 @@ impl AsyncPipe {
                     .await?,
             );
             let file_size = PAGE_SIZE * FILE_PAGE_COUNT;
-            file.hint_extent_size(file_size as usize).await?;
+            // // file.hint_extent_size(file_size as usize).await?;
             file.pre_allocate(file_size).await?;
+            // unsafe {
+            //     libc::fallocate64(
+            //         file.as_raw_fd(),
+            //         libc::FALLOC_FL_ZERO_RANGE,
+            //         0,
+            //         file_size as i64,
+            //     )
+            // };
             let mut buf = file.alloc_dma_buffer(4096);
             // FIXME(sticnarf): optimize
             let mut header = Vec::with_capacity(LogFileHeader::len());
@@ -136,7 +172,8 @@ impl AsyncPipe {
             files.write().fds.push_back(fd);
 
             Ok(())
-        }
+        };
+        Ok(fut)
     }
 
     /// Returns (seq, offset)
@@ -160,7 +197,7 @@ impl AsyncPipe {
                 Ok(_) => {
                     if res_seq > seq {
                         let fut = self.create_file(res_seq + 1);
-                        glommio::spawn_local(fut).detach();
+                        glommio::spawn_local(fut?).detach();
                     }
                     return Ok((res_seq, res_page * PAGE_SIZE));
                 }
@@ -246,9 +283,12 @@ impl AsyncPipe {
                 seq,
             };
             let path = file_id.build_file_path(&self.dir);
-            if let Err(e) = fs::remove_file(&path) {
+            let mut new_path = path.clone();
+            new_path.set_extension("deleted");
+            if let Err(e) = fs::rename(&path, &new_path) {
                 warn!("Remove purged log file {:?} failed: {}", path, e);
             }
+            self.free_list.lock().push(new_path);
         }
         Ok(purged)
     }
