@@ -120,9 +120,6 @@ impl AsyncPipe {
             let mut free_list = self.free_list.lock();
             if let Some(deleted) = free_list.pop() {
                 fs::rename(&deleted, &path)?;
-                drop(free_list);
-                let fd = Arc::new(LogFd::open(&path)?);
-                self.files.write().fds.push_back(fd);
             }
         }
         // let mut cmd = Command::new("dd")
