@@ -2,11 +2,13 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fs,
     path::PathBuf,
+    process::Command,
     rc::Rc,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    thread,
 };
 
 use crossbeam::utils::CachePadded;
@@ -116,6 +118,7 @@ impl AsyncPipe {
             seq,
         };
         let path = file_id.build_file_path(&self.dir);
+        let mut reused = false;
         {
             let mut free_list = self.free_list.lock();
             if let Some(deleted) = free_list.pop() {
@@ -123,35 +126,41 @@ impl AsyncPipe {
                 drop(free_list);
                 let fd = Arc::new(LogFd::open(&path)?);
                 self.files.write().fds.push_back(fd);
+                reused = true;
             }
         }
-        // let mut cmd = Command::new("dd")
-        //     .arg("if=/dev/zero")
-        //     .arg(format!("of={}", path.to_string_lossy()))
-        //     .arg("bs=16M")
-        //     .arg("count=64")
-        //     .arg("oflag=dsync")
-        //     .spawn()
-        //     .unwrap();
-        // let (tx, rx) = async_channel::bounded(1);
-        // thread::spawn(move || {
-        //     cmd.wait().ok();
-        //     tx.try_send(()).ok();
-        // });
+        let (tx, rx) = async_channel::bounded(1);
+        if !reused {
+            let mut cmd = Command::new("dd")
+                .arg("if=/dev/zero")
+                .arg(format!("of={}", path.to_string_lossy()))
+                .arg("bs=16M")
+                .arg("count=64")
+                .spawn()
+                .unwrap();
+            thread::spawn(move || {
+                cmd.wait().ok();
+                tx.try_send(()).ok();
+            });
+        }
+
         let files = self.files.clone();
         let fut = async move {
-            // rx.recv().await.ok();
+            if reused {
+                return Ok(());
+            }
+            rx.recv().await.ok();
             let file = Rc::new(
                 OpenOptions::new()
                     .write(true)
-                    .create(true)
+                    // .create(true)
                     // .custom_flags(O_DSYNC)
                     .dma_open(&path)
                     .await?,
             );
-            let file_size = PAGE_SIZE * FILE_PAGE_COUNT;
+            // let file_size = PAGE_SIZE * FILE_PAGE_COUNT;
             // // file.hint_extent_size(file_size as usize).await?;
-            file.pre_allocate(file_size).await?;
+            // file.pre_allocate(file_size).await?;
             // unsafe {
             //     libc::fallocate64(
             //         file.as_raw_fd(),
